@@ -1,10 +1,12 @@
 """度量配置服务：管理事实表的度量字段定义、类型和聚合方式。
 
 增强能力：
-- 消费 fact.defined 通道，关联度量到对应事实表
+- 消费 fact.defined 通道，关联度量到对应事实表（只有通过维度校验的定义才可见）
 - 自动推断度量类型和聚合方式（基于字段命名规则）
 - 可加性校验：非可加度量使用COUNT DISTINCT聚合
-- 消费 measure.suggested 自动创建建议度量
+- 消费 measure.suggested 自动创建建议度量；建议必须来自发布接口最终确认的
+  事实字段定义，每条建议对应实际生效的事实粒度和维度组合
+- 消费 fact.dim_validated 校验记录，与事实登记入口核对同一份校验结论
 """
 from __future__ import annotations
 
@@ -47,26 +49,47 @@ class MeasureConfigService(BaseModuleService):
         if not values.get("精度要求"):
             values["精度要求"] = inferred["precision"]
 
-        # 消费事实定义通道
+        # 消费事实定义通道（只有通过关联维度编码校验的定义才会出现在这里）
         fact_name = str(values.get("所属事实", "")).strip()
+        fact_context: dict[str, Any] = {}
         fact_msgs = store.channel.consume("fact.defined", "measure_config")
         for msg in fact_msgs:
             if msg["payload"].get("fact_name") == fact_name:
-                values["_fact_business_process"] = msg["payload"].get("business_process", "")
-                values["_fact_granularity"] = msg["payload"].get("granularity", "")
+                fact_context = msg["payload"]
 
-        # 消费度量建议通道
+        # 核对事实登记入口的同一份关联维度校验记录
+        dim_validation = _latest_dim_validation(fact_name)
+
+        # 消费度量建议通道：只采纳发布接口最终确认的定义生成的建议，
+        # 且建议必须对应当前度量名称，待修输入不会生成可用口径
+        suggestion: dict[str, Any] = {}
         suggested = store.channel.consume("measure.suggested", "measure_config")
         for s in suggested:
-            if s["payload"].get("fact_name") == fact_name:
-                # 核对建议与当前输入
-                values["度量类型"] = s["payload"].get("measure_type", values.get("度量类型", "DECIMAL(18,2)"))
-                values["聚合方式"] = s["payload"].get("agg_method", values.get("聚合方式", "SUM"))
-                values["是否可加"] = "是" if s["payload"].get("is_additive") else "否"
+            payload = s["payload"]
+            if (payload.get("fact_name") == fact_name
+                    and payload.get("measure_name") == measure_name
+                    and payload.get("dim_validated", True)):
+                suggestion = payload
+        if suggestion:
+            values["度量类型"] = suggestion.get("measure_type", values.get("度量类型", "DECIMAL(18,2)"))
+            values["聚合方式"] = suggestion.get("agg_method", values.get("聚合方式", "SUM"))
+            values["是否可加"] = "是" if suggestion.get("is_additive") else "否"
 
         entry, missing = super().create_entry(values)
         if entry is None:
             return None, missing
+
+        # 把事实侧上下文持久化到度量记录，度量配置工作台可核对同一份校验记录
+        if fact_context:
+            entry["_fact_business_process"] = fact_context.get("business_process", "")
+            entry["_fact_granularity"] = fact_context.get("granularity", "")
+        if dim_validation is not None:
+            entry["_fact_dim_validation"] = dim_validation
+        if suggestion:
+            # 每条建议对应实际生效的事实粒度和维度组合
+            entry["_suggested_granularity"] = suggestion.get("granularity", "")
+            entry["_suggested_dims"] = suggestion.get("related_dims", "")
+            entry["_suggestion_validation_id"] = suggestion.get("dim_validation_id")
 
         # 发布度量配置到数据通道
         store.channel.publish("measure.confirmed", {
@@ -133,7 +156,29 @@ class MeasureConfigService(BaseModuleService):
 
         # 消费统计
         base["consumed_facts"] = len(store.channel.consume("fact.defined", "measure_config"))
+
+        # 关联维度校验记录：与事实登记入口核对同一份结论
+        validation_records = [
+            msg["payload"] for msg in store.channel.topic_snapshot("fact.dim_validated")
+        ]
+        base["fact_dim_validation_records"] = validation_records[-10:]
+        base["fact_dim_validation_failed"] = sum(
+            1 for r in validation_records if not r.get("valid"))
         return base
+
+
+def _latest_dim_validation(fact_name: str) -> dict[str, Any] | None:
+    """读取事实关联维度校验记录通道，返回该事实最新一份校验记录。"""
+    if not fact_name:
+        return None
+    records = [
+        msg["payload"]
+        for msg in store.channel.topic_snapshot("fact.dim_validated")
+        if msg["payload"].get("fact_name") == fact_name
+    ]
+    if not records:
+        return None
+    return records[-1]
 
 
 def _infer_measure_props(measure_name: str) -> dict[str, Any]:
